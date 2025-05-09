@@ -1,10 +1,12 @@
 import logging
 import os
+import asyncio
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import aiosqlite
 from dotenv import load_dotenv
+from aiohttp import web
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
@@ -16,6 +18,7 @@ load_dotenv()
 BOT_TOKEN   = os.getenv("BOT_TOKEN")
 TIMEZONE    = os.getenv("TIMEZONE", "Europe/Moscow")
 NOTIFY_HOUR = int(os.getenv("NOTIFY_HOUR", "9"))
+PORT        = int(os.getenv("PORT", 8000))       # Render передаёт порт сюда
 if not BOT_TOKEN:
     raise RuntimeError("В .env не задан BOT_TOKEN")
 TZ = ZoneInfo(TIMEZONE)
@@ -147,15 +150,12 @@ async def init_db():
                 name TEXT NOT NULL,
                 expiration_date TEXT NOT NULL,
                 notify_day_before INTEGER NOT NULL,
-                notify_week_before INTEGER NOT NULL
+                notify_week_before INTEGER NOT NULL,
+                custom_time TEXT
             );
         """)
-        # add custom_time if missing
-        async with db.execute("PRAGMA table_info(products);") as cur:
-            cols = [r[1] for r in await cur.fetchall()]
-        if "custom_time" not in cols:
-            await db.execute("ALTER TABLE products ADD COLUMN custom_time TEXT;")
         await db.commit()
+
     # load language cache
     bot.lang_cache = {}
     async with aiosqlite.connect(DB_PATH) as db:
@@ -171,32 +171,26 @@ async def schedule_existing():
         ) as cur:
             async for pid, uid, name, exp_iso, nd, nw, cust in cur:
                 exp_dt = datetime.fromisoformat(exp_iso)
-                # 7 days
+                # за 7 дней
                 if nw:
-                    dt = datetime.combine((exp_dt - timedelta(days=7)).date(),
-                                          time(NOTIFY_HOUR, 0), tzinfo=TZ)
-                    sched.add_job(
-                        bot.send_message, trigger="date", run_date=dt,
-                        args=(uid, f"⏰ «{name}» истечёт через 7 дней. Совет: выкиньте или съешьте."),
-                        id=f"{pid}_7d", replace_existing=True
-                    )
-                # 1 day
+                    dt7 = datetime.combine((exp_dt - timedelta(days=7)).date(),
+                                           time(NOTIFY_HOUR, 0), tzinfo=TZ)
+                    sched.add_job(bot.send_message, "date", run_date=dt7,
+                                  args=(uid, f"⏰ «{name}» истечёт через 7 дней. Совет: выкиньте или съешьте."),
+                                  id=f"{pid}_7d", replace_existing=True)
+                # за 1 день
                 if nd:
-                    dt = datetime.combine((exp_dt - timedelta(days=1)).date(),
-                                          time(NOTIFY_HOUR, 0), tzinfo=TZ)
-                    sched.add_job(
-                        bot.send_message, trigger="date", run_date=dt,
-                        args=(uid, f"⚠️ «{name}» истечёт завтра. Совет: выкиньте или съешьте."),
-                        id=f"{pid}_1d", replace_existing=True
-                    )
+                    dt1 = datetime.combine((exp_dt - timedelta(days=1)).date(),
+                                           time(NOTIFY_HOUR, 0), tzinfo=TZ)
+                    sched.add_job(bot.send_message, "date", run_date=dt1,
+                                  args=(uid, f"⚠️ «{name}» истечёт завтра. Совет: выкиньте или съешьте."),
+                                  id=f"{pid}_1d", replace_existing=True)
                 # custom
                 if cust:
-                    dt = datetime.fromisoformat(cust)
-                    sched.add_job(
-                        bot.send_message, trigger="date", run_date=dt,
-                        args=(uid, f"🔔 «{name}» истечёт {dt.strftime('%d.%m.%Y %H:%M')}.\nСовет: выкиньте или съешьте."),
-                        id=f"{pid}_cust", replace_existing=True
-                    )
+                    dtc = datetime.fromisoformat(cust)
+                    sched.add_job(bot.send_message, "date", run_date=dtc,
+                                  args=(uid, f"🔔 «{name}» истечёт {dtc.strftime('%d.%m.%Y %H:%M')}.\nСовет: выкиньте или съешьте."),
+                                  id=f"{pid}_cust", replace_existing=True)
 
 # ─── UI ─────────────────────────────────────────────────────────────────────────
 def main_kb(locale: str) -> types.ReplyKeyboardMarkup:
@@ -204,6 +198,20 @@ def main_kb(locale: str) -> types.ReplyKeyboardMarkup:
     for txt in LOCALES[locale]["main_menu"]:
         kb.add(txt)
     return kb
+
+# ─── HTTP-сервер для health check ───────────────────────────────────────────────
+async def health(request):
+    return web.Response(text="OK")
+
+async def init_http():
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/healthz", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logging.info(f"HTTP server running on port {PORT}")
 
 # ─── Хендлеры ──────────────────────────────────────────────────────────────────
 @dp.message_handler(commands=["start"])
@@ -219,7 +227,6 @@ async def cmd_start(m: types.Message):
 async def choose_lang(c: types.CallbackQuery, state: FSMContext):
     code = c.data.split("_",1)[1]
     await set_locale(c.from_user.id, code)
-    # remove the inline keyboard so it can't be reused
     try:
         await c.message.edit_reply_markup()
     except:
@@ -228,7 +235,6 @@ async def choose_lang(c: types.CallbackQuery, state: FSMContext):
     await c.message.answer(loc["welcome"], reply_markup=main_kb(code))
     await state.finish()
 
-# handle the "Change language" button
 @dp.message_handler(lambda m: m.text == LOCALES[get_locale(m.from_user.id)]["main_menu"][2])
 async def cmd_change_lang(m: types.Message):
     await cmd_start(m)
@@ -289,7 +295,6 @@ async def proc_notify(c: types.CallbackQuery, state: FSMContext):
     nd = choice in ("day","both")
     nw = choice in ("week","both")
 
-    # save product
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "INSERT INTO products(user_id,name,expiration_date,notify_day_before,notify_week_before,custom_time) "
@@ -301,21 +306,15 @@ async def proc_notify(c: types.CallbackQuery, state: FSMContext):
 
     exp_dt = datetime.fromisoformat(exp_iso)
     if nw:
-        dt = datetime.combine((exp_dt - timedelta(days=7)).date(),
-                              time(NOTIFY_HOUR,0), tzinfo=TZ)
-        sched.add_job(
-            bot.send_message, trigger="date", run_date=dt,
-            args=(uid, f"⏰ «{name}» истечёт через 7 дней. Совет: выкиньте или съешьте."),
-            id=f"{pid}_7d", replace_existing=True
-        )
+        dt7 = datetime.combine((exp_dt - timedelta(days=7)).date(), time(NOTIFY_HOUR,0), tzinfo=TZ)
+        sched.add_job(bot.send_message, "date", run_date=dt7,
+                      args=(uid, f"⏰ «{name}» истечёт через 7 дней. Совет: выкиньте или съешьте."),
+                      id=f"{pid}_7d", replace_existing=True)
     if nd:
-        dt = datetime.combine((exp_dt - timedelta(days=1)).date(),
-                              time(NOTIFY_HOUR,0), tzinfo=TZ)
-        sched.add_job(
-            bot.send_message, trigger="date", run_date=dt,
-            args=(uid, f"⚠️ «{name}» истечёт завтра. Совет: выкиньте или съешьте."),
-            id=f"{pid}_1d", replace_existing=True
-        )
+        dt1 = datetime.combine((exp_dt - timedelta(days=1)).date(), time(NOTIFY_HOUR,0), tzinfo=TZ)
+        sched.add_job(bot.send_message, "date", run_date=dt1,
+                      args=(uid, f"⚠️ «{name}» истечёт завтра. Совет: выкиньте или съешьте."),
+                      id=f"{pid}_1d", replace_existing=True)
 
     await c.answer()
     if choice == "custom":
@@ -340,13 +339,11 @@ async def proc_custom(m: types.Message, state: FSMContext):
         await db.execute("UPDATE products SET custom_time=? WHERE id=?", (dt.isoformat(), pid))
         await db.commit()
 
-    sched.add_job(
-        bot.send_message, trigger="date", run_date=dt,
-        args=(uid,
-            f"🔔 «{name}» истечёт {dt.strftime('%d.%m.%Y %H:%M')}.\nСовет: выкиньте или съешьте."
-        ),
-        id=f"{pid}_cust", replace_existing=True
-    )
+    sched.add_job(bot.send_message, "date", run_date=dt,
+                  args=(uid,
+                      f"🔔 «{name}» истечёт {dt.strftime('%d.%m.%Y %H:%M')}.\nСовет: выкиньте или съешьте."
+                  ),
+                  id=f"{pid}_cust", replace_existing=True)
 
     await m.answer(loc["custom_ok"], reply_markup=main_kb(get_locale(uid)))
     await state.finish()
@@ -376,12 +373,14 @@ async def cmd_list(m: types.Message):
             parts.append(f"в {datetime.fromisoformat(cust).strftime('%d.%m %H:%M')}")
         opts = ", ".join(parts) if parts else "—"
         lines.append(f"• {name} — до {exp_str} (⏱ {opts})")
+
     await m.answer("\n".join(lines), reply_markup=main_kb(get_locale(uid)))
 
 # ─── Запуск ─────────────────────────────────────────────────────────────────────
 async def on_startup(dp):
     await init_db()
     await schedule_existing()
+    await init_http()         # запускаем HTTP-сервер для health check
     sched.start()
     logging.info("Scheduler started")
 
